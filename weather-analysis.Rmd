@@ -1,0 +1,202 @@
+---
+title: "Severe Weather Event Analysis"
+author: "Karl Wenzel"
+date: "April 8, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Synopsis
+
+Using data obtained from the U.S. National Oceanic and Atmospheric Administration's (NOAA) [storm database](https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2), along with the analysis described later in this report, it was determined that several strong patterns exist between the types of severe weather events vs. damage, injury and human death.  **With respect to population health:** wind and tornodo related events dominate all other categrories in terms of being the **most harmful**.  Regarding damage caused by weather events: floods, storms, rain and hail cause **the greatest economic consequences**, with wind and tornodoes being next beyond that.  It was also determined that different states had different results, and a pair of **sweet maps** are provided herein to explain these results in better detail.
+
+The code and reference data files used to create this document are available on github at [https://github.com/KarlWenzel/NOAA-Storm-Analysis](https://github.com/KarlWenzel/NOAA-Storm-Analysis), and the data set was obtained from the NOAA storm database as listed earlier.
+
+## Data Processing
+
+```{r message=FALSE}
+library(plyr)
+library(ggplot2)
+library(gridExtra)
+library(maps)
+library(RColorBrewer)
+```
+
+```{r data-processing}
+RAW = read.csv("repdata-data-StormData.csv.bz2")
+
+# We will store our processed data in STORMS
+STORMS = data.frame(
+  date =  strptime( RAW$BGN_DATE, format="%m/%d/%Y" ),
+  state = RAW$STATE,
+  evnt =  as.character( RAW$EVTYPE ),
+  dead =  RAW$FATALITIES,
+  hurt =  RAW$INJURIES,
+  prop =  RAW$PROPDMG,
+  pexp =  tolower( RAW$PROPDMGEXP ),
+  crop =  RAW$CROPDMG,
+  cexp =  tolower( RAW$CROPDMGEXP )
+)
+
+# Filter out extraneous data
+row.filter = (STORMS$dead + STORMS$hurt + STORMS$prop + STORMS$crop) > 0
+STORMS = STORMS[ row.filter, ]
+
+# Store year as a number
+STORMS$year = as.numeric( format(STORMS$date, "%Y") )
+
+# Since all data prior to 1955 is only for tornados, this data is discarded to avoid skewing
+#   see http://www.ncdc.noaa.gov/stormevents/details.jsp
+STORMS = STORMS[ STORMS$year > 1955, ]
+
+# Prepare exponent reference data; use to join a multiplier based on the exponent key
+my.exp = c( 1:9, "h", "k", "m", "b" )
+my.mul = c( 10^(1:9), 100, 1000, 1000000, 1000000000 )
+PEXP = data.frame( pexp = my.exp, pmul = my.mul )
+CEXP = data.frame( cexp = my.exp, cmul = my.mul )
+
+# Join the multipliers by matching the exponent keys
+STORMS = join( STORMS, PEXP, by="pexp", type="left", match="first" )
+STORMS = join( STORMS, CEXP, by="cexp", type="left", match="first" )
+
+# Any remaining unset conditions for the multipliers are set to 0
+STORMS[ is.na(STORMS$pmul),]$pmul = 0
+STORMS[ is.na(STORMS$cmul),]$cmul = 0
+
+# Scale the property damage and crop damage values by their multipliers
+STORMS$prop = STORMS$prop * STORMS$pmul
+STORMS$crop = STORMS$crop * STORMS$cmul
+
+# Prepare category reference data; this provides us with regex patterns 
+CATEGORIES = read.csv("category-reference.csv", stringsAsFactors=FALSE)
+print(CATEGORIES)
+
+# Use the patterns to assign categories
+
+STORMS$category = NA
+for (i in 1:nrow(CATEGORIES)) {
+  filter = is.na(STORMS$category) & grepl( CATEGORIES[i,]$patterns, STORMS$evnt )
+  STORMS[filter,]$category = CATEGORIES[i,]$category
+}
+
+# Any unset categories are grouped into their own category; promote to factor
+STORMS[ is.na(STORMS$category), ]$category = "Other"
+STORMS$category = as.factor(STORMS$category)
+
+# Remove the columns that are no longer necessary
+STORMS$cexp = NULL
+STORMS$pexp = NULL
+STORMS$X = NULL
+STORMS$pmul = NULL
+STORMS$cmul = NULL
+
+# We now have our tidy data set.
+print( head(STORMS) )
+
+# This is a good saving point if you are running my code.
+#   It creates a 17.8 MB file as opposed to the 548 MB uncompressed raw file
+write.csv(STORMS, "storms-tidy-dataset.csv")
+```
+
+## Results
+
+```{r results}
+# First of all, determine the basic results
+BASIC.SUMMARY = ddply(STORMS, .( category), summarize, 
+  sum.people = sum(dead) + sum(hurt),
+  sum.money = sum(prop) + sum(crop)
+)
+print( BASIC.SUMMARY )
+
+# Render 2 plots in one image.  Show total damages and injuries, by category
+
+basic.categories = levels(BASIC.SUMMARY$category)
+color.bins = length(basic.categories)
+colors = brewer.pal(color.bins, "Paired")
+
+p1 = ggplot( data=BASIC.SUMMARY, aes(category, sum.people/1000) )
+p1 = p1 + geom_bar(stat="identity", fill=colors)
+p1 = p1 + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+p1 = p1 + xlab("Weather Event Category") + ylab("People Killed or Injured in Thousands")
+p1 = p1 + ggtitle("People Hurt by Category")
+
+p2 = ggplot( data=BASIC.SUMMARY, aes(category, sum.money/1000000000) )
+p2 = p2 + geom_bar(stat="identity", fill=colors)
+p2 = p2 + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+p2 = p2 + xlab("Weather Event Category") + ylab("Damage in Billions of Dollars")
+p2 = p2 + ggtitle("Damage by Category")
+
+grid.arrange(p1, p2, ncol=2)
+
+# Now lets break it down by state
+SUMMARY = ddply(STORMS, .(state, category), summarize,
+  sum.people = sum(dead) + sum(hurt),
+  sum.money = sum(prop) + sum(crop)
+)
+
+# Determine the category with the greatest cause of money damage by state
+MONEY = ddply(SUMMARY, .(state), function(x){x[which.max(x$sum.money),]})
+
+# Load state reference data; we'll use this for matching to states on our map
+STATES = read.csv("states.csv")
+
+# Join the state reference data with our damage report by state
+MONEY$abbrev = MONEY$state
+STATES.MONEY = join( STATES, MONEY, by="abbrev", type="left", match="all" )
+
+# Reduce the category factor to only those in use
+STATES.MONEY$category = factor(STATES.MONEY$category)
+
+# Prepare our color palatte and category names
+category.names = levels(STATES.MONEY$category)
+color.bins = length(category.names)
+colors = brewer.pal(color.bins, "Set1")
+
+# Draw Map
+map("state", col = "gray80", fill = TRUE, lty = 0) #Base
+map("state", col = colors[STATES.MONEY$category], fill = TRUE, lty = 0, add = TRUE) #States
+map("state", col = "gray", lwd = 1.4, lty = 1, add = TRUE) #Borders
+title("Greatest Cause of Damage in Dollars by State")
+legend("bottomright", cex= 0.56, bty="n",
+   title="Source of Damage",
+   legend = category.names,
+   fill = colors
+)
+
+# Determine the category with the greatest cause of death and injury by state
+PEOPLE = ddply(SUMMARY, .(state), function(x){x[which.max(x$sum.people),]})
+
+# Load state reference data; we'll use this for matching to states on our map
+STATES = read.csv("states.csv")
+
+# Join the state reference data with our injury report by state
+PEOPLE$abbrev = PEOPLE$state
+STATES.PEOPLE = join( STATES, PEOPLE, by="abbrev", type="left", match="all" )
+
+# Reduce the category factor to only those in use
+STATES.PEOPLE$category = factor(STATES.PEOPLE$category)
+
+# Prepare our color palatte and category names
+category.names = levels(STATES.PEOPLE$category)
+color.bins = length(category.names)
+colors = brewer.pal(color.bins, "Set1")
+
+# Draw Map
+map("state", col = "gray80", fill = TRUE, lty = 0) #Base
+map("state", col = colors[STATES.PEOPLE$category], fill = TRUE, lty = 0, add = TRUE) #States
+map("state", col = "gray", lwd = 1.4, lty = 1, add = TRUE) #Borders
+title("Greatest Cause of Death and Injury by State")
+legend("bottomright", cex= 0.56, bty="n",
+   title="Source of Damage",
+   legend = category.names,
+   fill = colors
+)
+
+
+```
+
+## The End
+
